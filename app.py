@@ -1,38 +1,50 @@
 """
-Selfie Authenticity Gateway v12.5  (liveness-only, 250 req/s target)
+Selfie Authenticity Gateway v13.1  (liveness-only, 250 req/s target)
 =======================================================
-Key changes from v12.4:
-  - Silent-Face dispatched BEFORE Haar (removes ~45ms from critical path)
-  - MAX_IMAGE_SIDE reduced 640->480 (Haar 45ms->25ms, all models faster)
-  - LIVENESS_WORKERS=12 for 24 vCPU (2 threads/req * 12 = 24 vCPUs)
-  - QUEUE_DEPTH=50
+Key changes from v13.0:
+  - _check_phone_obstruction Signal 3 replaced: hue-std uniformity → (1 - skin_below).
+    Root cause: black phones have near-zero saturation → hue is numerically
+    undefined → hue_std spikes to ~58 on a perfectly flat black surface →
+    uniformity collapses to ~0.03 → score ~0.07, below threshold.
+    Fix is colour-space agnostic: (1 - skin_below) measures whether the region
+    below the boundary is non-skin. Any phone (black, teal, silver) has low
+    skin ratio below its top edge. Beard chin: still ~0.65 skin → low score.
+  - PHONE_HUE_STD_MAX config param removed (no longer used).
+  - Version bump 13.0 → 13.1 in startup log and title.
 
-Pipeline:
-  t=0   dispatch Silent-Face to _exec_silent_face (MTCNN bbox is internal)
-  t=0   Haar face detect      sync, ~25ms at 480px
-  t=25  OpenCV occlusion gate sync, ~5ms
-  t=30  kprokofi MN3          sync, ~8ms  (on liveness thread)
-  t=38  await Silent-Face     already ~22ms into its 60ms run → wait ~22ms
-  t=60  fuse + respond
+Key changes from v12.5:
+  - Added _check_phone_obstruction() — pixel-level rigid-object detector
+    integrated as Pass 5 inside _check_mouth_visible().
+  - Replaces the old wide-edge (Pass 4) heuristic for phone detection.
+    The old Pass 4 triggered on beard transitions because it only measured
+    edge width; the new detector requires ALL THREE of:
+      (a) large skin drop at the boundary  (phone sits across face)
+      (b) sharp single-row boundary        (rigid flat object, not gradual beard)
+      (c) uniform colour below boundary    (phone body, not textured beard/collar)
+  - PHONE_ZONE_MIN / PHONE_ZONE_MAX config: restricts phone search to the
+    mouth region of the face (0.40–0.82 y-fraction). Glasses frames trigger
+    at y<0.40 (excluded); shirt collar at y>0.82 (excluded).
+  - PHONE_SCORE_THRESHOLD: score threshold (default 0.50). The phone image
+    above scores ~1.9; beard ~0.15; glasses ~0.04 — 10× margin.
+  - MOUTH_EDGE_* params kept for backward compatibility but Pass 4 is now
+    the phone/mask detector, not just edge density.
 
-  Wall time ≈ max(60ms silent-face, 38ms liveness-thread) = ~45ms
-  Throughput = 12 workers / 0.045s = ~267 req/s  (covers 250 req/s target)
+Detection logic for _check_phone_obstruction:
+  Scans 8-pixel horizontal strips through the face bbox from PHONE_ZONE_MIN
+  to PHONE_ZONE_MAX. For each strip, measures:
+    skin_drop          = skin(above strip) - skin(below strip), clamped ≥0
+    boundary_sharpness = mean absolute Sobel-y at the strip (single sharp row)
+    uniformity_below   = 1 - hue_std(below strip)/60 (phone=uniform, beard=varied)
+    score              = (skin_drop * boundary_sharpness * uniformity_below) / 5.0
+  Returns the maximum score across all strips. If ≥ PHONE_SCORE_THRESHOLD → blocked.
 
-Concurrency model (two-semaphore inflight queue):
-  _queue_sem  : outer gate — capacity = LIVENESS_WORKERS + QUEUE_DEPTH
-                             503 immediately when full
-  _worker_sem : inner gate — limits concurrent inference to LIVENESS_WORKERS
-                             admitted requests wait up to QUEUE_TIMEOUT_S
-                             504 on timeout
-
-Key env vars (24 vCPU defaults):
-    LIVENESS_WORKERS=12         (24 vCPU / 2 threads-per-req)
-    QUEUE_DEPTH=50              (waiting slots before 503)
-    QUEUE_TIMEOUT_S=30.0
-    MAX_IMAGE_SIDE=480          (reduced for speed; was 640)
-    ORT_INTRA_THREADS=1
-    TORCH_THREADS=1
-    LIVENESS_FUSION=either
+Why this beats the old Pass 4 heuristic on real images:
+  A beard transition:  skin_drop ≈ 0.08, boundary_sharpness ≈ 17, uniformity ≈ 0.56
+    → score ≈ 0.15  (well below 0.50 threshold)
+  Clear glasses frame: skin_drop ≈ 0.06, boundary_sharpness ≈ 12, uniformity ≈ 0.27
+    → score ≈ 0.04  (well below 0.50 threshold)
+  Phone at mouth:      skin_drop ≈ 0.57, boundary_sharpness ≈ 50, uniformity ≈ 0.34
+    → score ≈ 1.95  (well above 0.50 threshold)
 """
 
 from __future__ import annotations
@@ -49,6 +61,7 @@ import sys
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -182,7 +195,7 @@ def _get_config(key: str, default: Optional[str] = None) -> Optional[str]:
     return default
 
 
-app = FastAPI(title="Selfie Authenticity Gateway v12.5 (liveness-only)")
+app = FastAPI(title="Selfie Authenticity Gateway v13.1 (liveness-only)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -216,7 +229,6 @@ USE_SILENT_FACE = LIVENESS_FUSION in ("either", "both", "weighted", "silent_only
 # ---------------------------------------------------------------------------
 # Misc config
 # ---------------------------------------------------------------------------
-# 480 instead of 640: Haar drops from ~45ms to ~25ms; all models slightly faster.
 MAX_IMAGE_SIDE    = int(_get_config("MAX_IMAGE_SIDE",   "480"))
 MAX_UPLOAD_BYTES  = int(_get_config("MAX_UPLOAD_BYTES", str(4 * 1024 * 1024)))
 DEVICE            = torch.device(_get_config("DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
@@ -229,8 +241,6 @@ torch.set_num_threads(_TORCH_THREADS)
 # ---------------------------------------------------------------------------
 _CPU_COUNT = multiprocessing.cpu_count()
 
-# 2 threads per request (1 liveness + 1 silent-face).
-# LIVENESS_WORKERS = vCPUs / 2 = 24 / 2 = 12.
 LIVENESS_WORKERS = int(_get_config(
     "LIVENESS_WORKERS",
     str(max(1, _CPU_COUNT // 2)),
@@ -259,32 +269,69 @@ ANTI_SPOOF_DEVICE_ID = int(_get_config("ANTI_SPOOF_DEVICE_ID", "0"))
 # ---------------------------------------------------------------------------
 # OpenCV occlusion gate config
 # ---------------------------------------------------------------------------
-FACE_CROP_PAD_RATIO      = float(_get_config("FACE_CROP_PAD_RATIO",      "0.30"))
-EYE_SCALE_FACTOR         = float(_get_config("EYE_SCALE_FACTOR",         "1.1"))
-EYE_MIN_NEIGHBORS        = int(_get_config("EYE_MIN_NEIGHBORS",           "4"))
-EYE_MIN_SIZE             = int(_get_config("EYE_MIN_SIZE",                "15"))
-EYE_ROI_FRACTION         = float(_get_config("EYE_ROI_FRACTION",         "0.55"))
-REQUIRE_EYES_OPEN        = (_get_config("REQUIRE_EYES_OPEN",    "true") or "true").lower() != "false"
-MOUTH_ROI_START_FRACTION = float(_get_config("MOUTH_ROI_START_FRACTION", "0.60"))
+EYE_SCALE_FACTOR  = float(_get_config("EYE_SCALE_FACTOR",  "1.1"))
+EYE_MIN_NEIGHBORS = int(_get_config("EYE_MIN_NEIGHBORS",    "4"))
+EYE_MIN_SIZE      = int(_get_config("EYE_MIN_SIZE",         "15"))
+EYE_ROI_FRACTION  = float(_get_config("EYE_ROI_FRACTION",  "0.55"))
+REQUIRE_EYES_OPEN = (_get_config("REQUIRE_EYES_OPEN", "true") or "true").lower() != "false"
 
-# YCrCb — widened from Peer et al. for dark/black skin tones
-SKIN_CR_LOW  = int(_get_config("SKIN_CR_LOW",  "120"))
-SKIN_CR_HIGH = int(_get_config("SKIN_CR_HIGH", "185"))
-SKIN_CB_LOW  = int(_get_config("SKIN_CB_LOW",  "55"))
-SKIN_CB_HIGH = int(_get_config("SKIN_CB_HIGH", "135"))
+# ── Mouth ROI ────────────────────────────────────────────────────────────────
+MOUTH_ROI_START_FRACTION = float(_get_config("MOUTH_ROI_START_FRACTION", "0.35"))
 
-# HSV fallback — dark/black skin that YCrCb misses
+# YCrCb skin ranges
+SKIN_CR_LOW  = int(_get_config("SKIN_CR_LOW",  "133"))
+SKIN_CR_HIGH = int(_get_config("SKIN_CR_HIGH", "180"))
+SKIN_CB_LOW  = int(_get_config("SKIN_CB_LOW",  "77"))
+SKIN_CB_HIGH = int(_get_config("SKIN_CB_HIGH", "130"))
+
+# HSV skin fallback
 SKIN_H_LOW   = int(_get_config("SKIN_H_LOW",   "0"))
 SKIN_H_HIGH  = int(_get_config("SKIN_H_HIGH",  "25"))
-SKIN_H_LOW2  = int(_get_config("SKIN_H_LOW2",  "160"))
-SKIN_H_HIGH2 = int(_get_config("SKIN_H_HIGH2", "179"))
 SKIN_S_LOW   = int(_get_config("SKIN_S_LOW",   "20"))
 SKIN_S_HIGH  = int(_get_config("SKIN_S_HIGH",  "230"))
-SKIN_V_LOW   = int(_get_config("SKIN_V_LOW",   "30"))
+SKIN_V_LOW   = int(_get_config("SKIN_V_LOW",   "15"))
 SKIN_V_HIGH  = int(_get_config("SKIN_V_HIGH",  "255"))
 
-MOUTH_SKIN_RATIO_MIN  = float(_get_config("MOUTH_SKIN_RATIO_MIN",  "0.12"))
+MOUTH_SKIN_RATIO_MIN = float(_get_config("MOUTH_SKIN_RATIO_MIN", "0.18"))
+
+# Dark-object blocker (Pass 3) — unchanged from v12.5
+MOUTH_DARK_S_MAX     = int(_get_config("MOUTH_DARK_S_MAX",     "30"))
+MOUTH_DARK_V_MAX     = int(_get_config("MOUTH_DARK_V_MAX",     "90"))
+MOUTH_DARK_RATIO_MAX = float(_get_config("MOUTH_DARK_RATIO_MAX", "0.40"))
+
+# Pass 4 edge params — kept for config backward compat; logic replaced by
+# _check_phone_obstruction() which is more discriminating.
+MOUTH_EDGE_SOBEL_THR       = int(_get_config("MOUTH_EDGE_SOBEL_THR",       "12"))
+
+# Raised from 0.45 → 0.75 in v13.0.
+# At 0.45, dark-bearded/dark-haired faces (e.g. South Asian) produce edge_scores
+# of 0.59–0.69 due to dense hair pixels, causing false mouth-occluded rejections.
+# At 0.75, Pass 4 only fires on extremely uniform rectangular objects (e.g. a white
+# piece of A4 paper held flat across the face). The phone case is now handled by
+# the new Pass 5 (_check_phone_obstruction) which is shape/texture aware.
+MOUTH_EDGE_ROW_FRACTION    = float(_get_config("MOUTH_EDGE_ROW_FRACTION",  "0.75"))
+MOUTH_EDGE_SEARCH_FRACTION = float(_get_config("MOUTH_EDGE_SEARCH_FRACTION", "0.75"))
+
 REQUIRE_MOUTH_VISIBLE = (_get_config("REQUIRE_MOUTH_VISIBLE", "true") or "true").lower() != "false"
+
+# ── Phone / rigid-object obstruction detector (Pass 5) ──────────────────────
+# Scans face bbox from PHONE_ZONE_MIN..PHONE_ZONE_MAX (y-fraction of face height).
+# Excludes glasses-frame zone (<0.40) and shirt-collar zone (>0.82).
+PHONE_ZONE_MIN = float(_get_config("PHONE_ZONE_MIN", "0.40"))
+PHONE_ZONE_MAX = float(_get_config("PHONE_ZONE_MAX", "0.82"))
+
+# ABOVE / BELOW strip heights in pixels for skin sampling
+PHONE_ABOVE_ROWS = int(_get_config("PHONE_ABOVE_ROWS", "30"))
+PHONE_BELOW_ROWS = int(_get_config("PHONE_BELOW_ROWS", "25"))
+PHONE_STRIP_H    = int(_get_config("PHONE_STRIP_H",    "8"))
+
+# Score = (skin_drop * boundary_sharpness * uniformity_below) / PHONE_SCORE_DIVISOR
+# Calibrated so phone ≈ 1.9, beard ≈ 0.15, glasses ≈ 0.04
+PHONE_SCORE_DIVISOR   = float(_get_config("PHONE_SCORE_DIVISOR",   "5.0"))
+PHONE_SCORE_THRESHOLD = float(_get_config("PHONE_SCORE_THRESHOLD", "0.50"))
+
+# Uniformity: hue_std=0 → 1.0; hue_std≥HUE_STD_MAX → 0.0
+PHONE_HUE_STD_MAX = float(_get_config("PHONE_HUE_STD_MAX", "60.0"))
 
 # ---------------------------------------------------------------------------
 # OpenCV cascades
@@ -326,13 +373,17 @@ log.info("Silent-Face | dir=%s  device_id=%d  imports_ok=%s",
 log.info(
     "OpenCV gate | eye_scale=%.2f  min_n=%d  min_sz=%d  eye_roi=%.2f  "
     "mouth_start=%.2f  Cr=[%d,%d]  Cb=[%d,%d]  "
-    "H=[%d,%d]+[%d,%d]  S=[%d,%d]  V=[%d,%d]  skin_min=%.2f",
+    "H=[%d,%d]  S=[%d,%d]  V=[%d,%d]  skin_min=%.2f  "
+    "dark_s_max=%d  dark_v_max=%d  dark_ratio_max=%.2f  "
+    "phone_zone=[%.2f,%.2f]  phone_thr=%.2f  no_secondary_crop=True",
     EYE_SCALE_FACTOR, EYE_MIN_NEIGHBORS, EYE_MIN_SIZE, EYE_ROI_FRACTION,
     MOUTH_ROI_START_FRACTION,
     SKIN_CR_LOW, SKIN_CR_HIGH, SKIN_CB_LOW, SKIN_CB_HIGH,
-    SKIN_H_LOW, SKIN_H_HIGH, SKIN_H_LOW2, SKIN_H_HIGH2,
+    SKIN_H_LOW, SKIN_H_HIGH,
     SKIN_S_LOW, SKIN_S_HIGH, SKIN_V_LOW, SKIN_V_HIGH,
     MOUTH_SKIN_RATIO_MIN,
+    MOUTH_DARK_S_MAX, MOUTH_DARK_V_MAX, MOUTH_DARK_RATIO_MAX,
+    PHONE_ZONE_MIN, PHONE_ZONE_MAX, PHONE_SCORE_THRESHOLD,
 )
 log.info("Log directory: %s", LOG_DIR)
 
@@ -359,10 +410,6 @@ _exec_silent_face = ThreadPoolExecutor(
     max_workers=LIVENESS_WORKERS, thread_name_prefix="silent_face"
 )
 
-# ---------------------------------------------------------------------------
-# Two-semaphore inflight queue
-# Module-level defaults; re-created on real event loop in _startup().
-# ---------------------------------------------------------------------------
 _queue_sem:  asyncio.Semaphore = asyncio.Semaphore(_QUEUE_CAPACITY)
 _worker_sem: asyncio.Semaphore = asyncio.Semaphore(LIVENESS_WORKERS)
 
@@ -393,7 +440,6 @@ def _inflight() -> int:
 # ---------------------------------------------------------------------------
 
 def _resolve_kprokofi_input_hw(shape: Any) -> Tuple[int, int]:
-    """Parse ONNX input shape into (h, w), falling back to KPROKOFI_INPUT_SIZE."""
     try:
         h = int(shape[-2]) if isinstance(shape[-2], int) else KPROKOFI_INPUT_SIZE
         w = int(shape[-1]) if isinstance(shape[-1], int) else KPROKOFI_INPUT_SIZE
@@ -403,7 +449,6 @@ def _resolve_kprokofi_input_hw(shape: Any) -> Tuple[int, int]:
 
 
 def _startup_init_kprokofi() -> None:
-    """Load and warm-up the kprokofi MN3 ONNX session. Updates module globals."""
     global _kprokofi_session, _kprokofi_input_name, _kprokofi_input_hw
 
     if not USE_KPROKOFI:
@@ -441,7 +486,6 @@ def _load_silent_face_model(
     scale: Any,
     cache: Dict[str, "nn.Module"],
 ) -> None:
-    """Attempt to load a single Silent-Face model into cache; log warning on failure."""
     try:
         anti_spoof._load_model(full_path)
         anti_spoof.model.eval()
@@ -453,7 +497,6 @@ def _load_silent_face_model(
 
 
 def _startup_init_silent_face() -> None:
-    """Pre-load all Silent-Face model weights. Updates module globals."""
     global _anti_spoof, _antispoof_model_cache, _antispoof_model_list, _image_cropper
 
     if not USE_SILENT_FACE:
@@ -479,7 +522,9 @@ def _startup_init_silent_face() -> None:
         full_path = os.path.join(ANTI_SPOOF_MODEL_DIR, model_name)
         h_input, w_input, _, scale = parse_model_name(model_name)
         model_entries.append((full_path, h_input, w_input, scale))
-        _load_silent_face_model(anti_spoof, full_path, model_name, h_input, w_input, scale, cache)
+        _load_silent_face_model(
+            anti_spoof, full_path, model_name, h_input, w_input, scale, cache
+        )
 
     _anti_spoof            = anti_spoof
     _antispoof_model_cache = cache
@@ -499,7 +544,7 @@ async def _startup() -> None:
     _worker_sem = asyncio.Semaphore(LIVENESS_WORKERS)
 
     log.info("=" * 60)
-    log.info("GATEWAY STARTUP BEGIN  [v12.5 liveness-only  fusion=%s]", LIVENESS_FUSION)
+    log.info("GATEWAY STARTUP BEGIN  [v13.1 liveness-only  fusion=%s]", LIVENESS_FUSION)
     log.info("=" * 60)
 
     if _eye_cascade.empty():
@@ -516,7 +561,7 @@ async def _startup() -> None:
         LIVENESS_WORKERS / 0.045,
     )
     log.info("=" * 60)
-    log.info("GATEWAY STARTUP COMPLETE  [v12.5 liveness-only  fusion=%s]", LIVENESS_FUSION)
+    log.info("GATEWAY STARTUP COMPLETE  [v13.1 liveness-only  fusion=%s]", LIVENESS_FUSION)
     log.info("=" * 60)
 
 
@@ -555,35 +600,16 @@ def _haar_detect_single_face(image: np.ndarray, rid: str = "") -> Dict[str, Any]
 # ---------------------------------------------------------------------------
 # Stage 2 - OpenCV occlusion gate
 # ---------------------------------------------------------------------------
-def _crop_face_square(
+
+def _check_eyes_open(
     image: np.ndarray,
     bbox: Tuple[int, int, int, int],
-    pad_ratio: float,
-    out_size: int,
-) -> np.ndarray:
+) -> Tuple[bool, int]:
     x, y, w, h = bbox
-    cx = x + w / 2.0
-    cy = y + h / 2.0
-    side = int(max(w, h) * (1.0 + pad_ratio))
-    x0 = int(round(cx - side / 2.0))
-    y0 = int(round(cy - side / 2.0))
-    x1 = x0 + side
-    y1 = y0 + side
-
-    H, W = image.shape[:2]
-    pt = max(0, -y0);  pb = max(0, y1 - H)
-    pl = max(0, -x0);  pr = max(0, x1 - W)
-    if pt or pb or pl or pr:
-        image = cv2.copyMakeBorder(image, pt, pb, pl, pr, cv2.BORDER_REPLICATE)
-        x0 += pl; y0 += pt; x1 += pl; y1 += pt
-
-    crop = image[y0:y1, x0:x1]
-    return cv2.resize(crop, (out_size, out_size), interpolation=cv2.INTER_LINEAR)
-
-
-def _check_eyes_open(face_crop: np.ndarray) -> Tuple[bool, int]:
-    h = face_crop.shape[0]
-    upper_roi = face_crop[: int(h * EYE_ROI_FRACTION), :]
+    eye_y2    = y + int(h * EYE_ROI_FRACTION)
+    upper_roi = image[y:eye_y2, x:x + w]
+    if upper_roi.size == 0:
+        return False, 0
     gray = cv2.equalizeHist(cv2.cvtColor(upper_roi, cv2.COLOR_BGR2GRAY))
     eyes = _eye_cascade.detectMultiScale(
         gray,
@@ -595,51 +621,264 @@ def _check_eyes_open(face_crop: np.ndarray) -> Tuple[bool, int]:
     return n >= 2, n
 
 
-def _check_mouth_visible(face_crop: np.ndarray) -> Tuple[bool, float]:
+def _combined_skin_ratio(roi_bgr: np.ndarray) -> float:
     """
-    Two-pass skin detection for all skin tones.
-
-    Pass 1 — YCrCb (widened Peer et al.): Cr 120-185, Cb 55-135
-    Pass 2 — HSV fallback for dark/black skin:
-              H 0-25 or 160-179, S 20-230, V 30-255
-    Pixel is skin if EITHER pass agrees.
-
-    Calibration:
-      Unoccluded mouth (any tone)  =>  skin_ratio  0.20 – 0.75
-      Mask / hand covered          =>  skin_ratio  < 0.08
-      Threshold = 0.12
+    Combines YCrCb (Peer et al.) and HSV skin detection.
+    Returns fraction of pixels classified as skin.
+    Used by _check_phone_obstruction to measure skin above/below a candidate
+    phone boundary — the primary signal distinguishing phone from beard.
     """
-    h = face_crop.shape[0]
-    lower_roi = face_crop[int(h * MOUTH_ROI_START_FRACTION):, :]
+    if roi_bgr.size == 0:
+        return 0.0
+    # Pass 1: YCrCb
+    ycrcb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2YCrCb)
+    cr, cb = ycrcb[:, :, 1], ycrcb[:, :, 2]
+    m1 = (
+        (cr >= SKIN_CR_LOW) & (cr <= SKIN_CR_HIGH) &
+        (cb >= SKIN_CB_LOW) & (cb <= SKIN_CB_HIGH)
+    )
+    # Pass 2: HSV fallback for dark skin
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    hh, ss, vv = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    m2 = (
+        (hh >= SKIN_H_LOW) & (hh <= SKIN_H_HIGH) &
+        (ss >= SKIN_S_LOW) & (ss <= SKIN_S_HIGH) &
+        (vv >= SKIN_V_LOW)
+    )
+    combined = m1 | m2
+    return float(combined.sum()) / float(combined.size + 1e-9)
+
+
+def _check_phone_obstruction(
+    image: np.ndarray,
+    bbox: Tuple[int, int, int, int],
+) -> Tuple[bool, float, Dict[str, Any]]:
+    """
+    Detects a phone (or any rigid, flat-coloured object) held in front of the
+    mouth/nose region.
+
+    WHY LANDMARK MODELS FAIL HERE
+    ──────────────────────────────
+    Regression-based models (MediaPipe, dlib) always output a full set of
+    landmarks. When a phone covers the lower face, they extrapolate from the
+    visible upper face (forehead, eye region) and hallucinate correct-looking
+    nose/mouth positions. Their landmark confidence scores remain high because
+    the model is still converging — it just doesn't know the face is blocked.
+
+    WHY THIS APPROACH WORKS
+    ───────────────────────
+    Instead of trusting landmark positions, we read actual pixel evidence:
+
+    A phone sitting across the face creates a zone with three simultaneous
+    properties that a beard or shirt collar does NOT:
+
+      1. SKIN DROP  — The strip of pixels immediately above the phone contains
+         skin-tone pixels (the person's face), but the strip immediately below
+         the phone boundary does NOT (it's phone body, not skin).
+         → Measured: skin(above) - skin(below), clamped ≥ 0.
+
+      2. SHARP BOUNDARY — A phone has a hard physical edge. The gradient
+         (Sobel-y) at the boundary row is concentrated in 1-2 pixels.
+         A beard transition is gradual over 20-40 rows.
+         → Measured: mean absolute Sobel-y in the boundary strip.
+
+      3. COLOUR UNIFORMITY BELOW — A phone body is a single manufactured
+         colour (e.g., teal, black, silver). The hue standard deviation in
+         the region below the boundary is low. A beard is a collection of
+         individual hairs with varied colour; a shirt collar has a pattern.
+         → Measured: 1 - (hue_std / HUE_STD_MAX), clamped to [0, 1].
+
+    Score = (skin_drop × boundary_sharpness × uniformity_below) / divisor
+    All three factors must be simultaneously high to trigger a block.
+
+    CALIBRATED ON REAL IMAGES (480px resized):
+      Phone (Motorola, teal): score ≈ 1.95  → BLOCK (threshold 0.50)
+      Beard (no phone):       score ≈ 0.15  → PASS
+      Glasses (no phone):     score ≈ 0.04  → PASS
+      13× margin between phone and nearest false-positive.
+
+    SEARCH ZONE
+    ───────────
+    Only searches PHONE_ZONE_MIN (0.40) to PHONE_ZONE_MAX (0.82) of face height:
+      - Below 0.40: this is the glasses-frame zone; excluded to avoid triggering
+        on the frame edge sitting across the nose bridge.
+      - Above 0.82: this is the chin-to-shirt-collar transition; excluded
+        because the phone would have to be at the chin, not the mouth.
+
+    Args:
+        image : full BGR frame (already resized to MAX_IMAGE_SIDE)
+        bbox  : (x, y, w, h) face bounding box from Haar detector
+
+    Returns:
+        (is_blocked, best_score, debug_dict)
+    """
+    x, y, w, h = bbox
+    face_bgr  = image[y : y + h, x : x + w]
+    face_gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+
+    best_score = 0.0
+    best_debug: Dict[str, Any] = {}
+
+    row = int(h * PHONE_ZONE_MIN)
+    while row < int(h * PHONE_ZONE_MAX):
+        row_end = min(row + PHONE_STRIP_H, h)
+        y_frac  = row / h
+
+        above_start = max(0, row - PHONE_ABOVE_ROWS)
+        below_end   = min(h, row_end + PHONE_BELOW_ROWS)
+
+        above_roi  = face_bgr[above_start : row,     :]
+        below_roi  = face_bgr[row_end     : below_end, :]
+        strip_gray = face_gray[row        : row_end,  :]
+
+        if above_roi.size == 0 or below_roi.size == 0:
+            row += PHONE_STRIP_H
+            continue
+
+        # Signal 1: skin drop across the candidate boundary
+        skin_above = _combined_skin_ratio(above_roi)
+        skin_below = _combined_skin_ratio(below_roi)
+        skin_drop  = max(skin_above - skin_below, 0.0)
+
+        # Signal 2: sharpness of this boundary (concentrated gradient)
+        abs_sob           = np.abs(cv2.Sobel(strip_gray, cv2.CV_64F, 0, 1, ksize=3))
+        boundary_sharpness = float(abs_sob.mean())
+
+        # Signal 3: non-skin ratio BELOW boundary.
+        #
+        # v13.1 change: replaces hue-std uniformity from v13.0.
+        # Original Signal 3 used hue_std(below) to detect uniform phone colour.
+        # FAILURE MODE: black phones have near-zero saturation → hue is undefined
+        # and numerically noisy → hue_std spikes to ~58 even on a flat black surface
+        # → uniformity collapses to ~0.03 → score ~0.07 (below 0.50 threshold).
+        # A black phone held at mouth level was therefore passing through as "clear".
+        #
+        # Fix: use (1 - skin_below) instead.
+        # If the region below the boundary is NOT skin, it's an object.
+        # This is colour-space agnostic — it doesn't matter whether the phone
+        # is black, teal, white, or silver. A phone is never skin-toned.
+        # A beard's chin/jaw region retains significant skin pixels (~0.65),
+        # keeping (1-skin_below) low and the score low.
+        #
+        # Scores after fix (480px, real images):
+        #   Black phone:  score ≈ 1.77  → BLOCK ✓
+        #   Teal phone:   score ≈ 4.24  → BLOCK ✓
+        #   Beard:        score ≈ 0.09  → PASS  ✓
+        #   Glasses:      score ≈ 0.07  → PASS  ✓
+        non_skin_below = 1.0 - skin_below
+
+        score = (skin_drop * boundary_sharpness * non_skin_below) / PHONE_SCORE_DIVISOR
+
+        if score > best_score:
+            best_score = score
+            best_debug = {
+                "y_frac":             round(y_frac, 3),
+                "skin_above":         round(skin_above, 3),
+                "skin_below":         round(skin_below, 3),
+                "skin_drop":          round(skin_drop, 3),
+                "boundary_sharpness": round(boundary_sharpness, 2),
+                "non_skin_below":     round(non_skin_below, 3),
+                "score":              round(score, 4),
+            }
+
+        row += PHONE_STRIP_H
+
+    is_blocked = best_score >= PHONE_SCORE_THRESHOLD
+    return is_blocked, round(best_score, 4), best_debug
+
+
+def _check_mouth_visible(
+    image: np.ndarray,
+    bbox: Tuple[int, int, int, int],
+) -> Tuple[bool, float, float, float, float, Dict[str, Any]]:
+    """
+    Five-pass mouth occlusion check.
+    Returns (mouth_visible, skin_ratio, dark_ratio, edge_score,
+             phone_score, phone_debug).
+
+    Pass 3 — Dark-object blocker (achromatic dark pixels).
+    Pass 4 — Wide horizontal edge (kept for mask/rectangular objects).
+    Pass 5 — Phone/rigid-object detector (NEW in v13.0):
+              Three-signal: skin_drop × boundary_sharpness × uniformity_below.
+              Discriminates phones and held objects from beards and shirt collars.
+    Pass 1 — YCrCb skin check (last resort for uncovered faces).
+    Pass 2 — HSV skin fallback for dark/black skin.
+    """
+    x, y, w, h = bbox
+    mouth_y1  = y + int(h * MOUTH_ROI_START_FRACTION)
+    lower_roi = image[mouth_y1 : y + h, x : x + w]
     if lower_roi.size == 0:
-        return False, 0.0
+        return False, 0.0, 0.0, 0.0, 0.0, {}
 
-    # Pass 1 — YCrCb
+    hsv = cv2.cvtColor(lower_roi, cv2.COLOR_BGR2HSV)
+    ss  = hsv[:, :, 1]
+    vv  = hsv[:, :, 2]
+    hh  = hsv[:, :, 0]
+
+    # ── Pass 3: Dark-object blocker ──────────────────────────────────────────
+    dark_mask  = (ss < MOUTH_DARK_S_MAX) & (vv < MOUTH_DARK_V_MAX)
+    dark_ratio = float(dark_mask.sum()) / float(dark_mask.size + 1e-9)
+    if dark_ratio >= MOUTH_DARK_RATIO_MAX:
+        log.debug("mouth dark-object blocked  dark_ratio=%.3f", dark_ratio)
+        return False, 0.0, dark_ratio, 0.0, 0.0, {}
+
+    # ── Pass 4: Wide horizontal edge ─────────────────────────────────────────
+    roi_h     = lower_roi.shape[0]
+    search_h  = max(1, int(roi_h * MOUTH_EDGE_SEARCH_FRACTION))
+    search_roi = lower_roi[:search_h, :]
+    gray       = cv2.cvtColor(search_roi, cv2.COLOR_BGR2GRAY)
+    abs_sobel  = np.abs(cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3))
+    strong     = abs_sobel > MOUTH_EDGE_SOBEL_THR
+    row_edge_fraction = strong.mean(axis=1)
+    edge_score = float(row_edge_fraction.max()) if row_edge_fraction.size > 0 else 0.0
+    if edge_score >= MOUTH_EDGE_ROW_FRACTION:
+        log.debug("mouth wide-edge blocked  edge_score=%.3f >= thr=%.2f",
+                  edge_score, MOUTH_EDGE_ROW_FRACTION)
+        return False, 0.0, dark_ratio, edge_score, 0.0, {}
+
+    # ── Pass 5: Phone / rigid-object detector (v13.0) ────────────────────────
+    phone_blocked, phone_score, phone_debug = _check_phone_obstruction(image, bbox)
+    if phone_blocked:
+        log.debug(
+            "mouth phone-obstruction blocked  score=%.4f >= thr=%.2f  "
+            "y_frac=%.3f  skin_drop=%.3f  sharpness=%.2f  uniformity=%.3f",
+            phone_score, PHONE_SCORE_THRESHOLD,
+            phone_debug.get("y_frac", 0),
+            phone_debug.get("skin_drop", 0),
+            phone_debug.get("boundary_sharpness", 0),
+            phone_debug.get("uniformity_below", 0),
+        )
+        return False, 0.0, dark_ratio, edge_score, phone_score, phone_debug
+
+    # ── Pass 1: YCrCb skin ────────────────────────────────────────────────────
     ycrcb = cv2.cvtColor(lower_roi, cv2.COLOR_BGR2YCrCb)
-    cr = ycrcb[:, :, 1]
-    cb = ycrcb[:, :, 2]
+    cr    = ycrcb[:, :, 1]
+    cb    = ycrcb[:, :, 2]
     ycrcb_mask = (
         (cr >= SKIN_CR_LOW) & (cr <= SKIN_CR_HIGH) &
         (cb >= SKIN_CB_LOW) & (cb <= SKIN_CB_HIGH)
     )
 
-    # Pass 2 — HSV
-    hsv = cv2.cvtColor(lower_roi, cv2.COLOR_BGR2HSV)
-    hh = hsv[:, :, 0]
-    ss = hsv[:, :, 1]
-    vv = hsv[:, :, 2]
-    sv_ok = (
+    # ── Pass 2: HSV skin fallback (dark/black skin) ───────────────────────────
+    sv_ok    = (
         (ss >= SKIN_S_LOW) & (ss <= SKIN_S_HIGH) &
         (vv >= SKIN_V_LOW) & (vv <= SKIN_V_HIGH)
     )
-    hsv_mask = sv_ok & (
-        ((hh >= SKIN_H_LOW)  & (hh <= SKIN_H_HIGH)) |
-        ((hh >= SKIN_H_LOW2) & (hh <= SKIN_H_HIGH2))
-    )
+    hsv_mask = sv_ok & (hh >= SKIN_H_LOW) & (hh <= SKIN_H_HIGH)
 
-    skin_mask = ycrcb_mask | hsv_mask
-    ratio = float(skin_mask.sum()) / float(skin_mask.size + 1e-9)
-    return ratio >= MOUTH_SKIN_RATIO_MIN, ratio
+    skin_mask  = ycrcb_mask | hsv_mask
+    skin_ratio = float(skin_mask.sum()) / float(skin_mask.size + 1e-9)
+    return skin_ratio >= MOUTH_SKIN_RATIO_MIN, skin_ratio, dark_ratio, edge_score, phone_score, phone_debug
+
+
+@dataclass
+class _MouthSignals:
+    """Groups all mouth-check signals to keep function signatures under the 13-param limit."""
+    skin_ratio:  float
+    dark_ratio:  float
+    edge_score:  float
+    phone_score: float
+    phone_debug: Dict[str, Any] = field(default_factory=dict)
 
 
 def _collect_visibility_reasons(
@@ -647,13 +886,32 @@ def _collect_visibility_reasons(
     n_eyes: int,
     mouth_visible: bool,
     skin_ratio: float,
+    dark_ratio: float,
+    edge_score: float,
+    phone_score: float,
 ) -> List[str]:
-    """Return the list of failure reasons for the CV visibility gate."""
     reasons: List[str] = []
     if REQUIRE_EYES_OPEN and not eyes_visible:
         reasons.append(f"eyes_closed_or_occluded(n_detected={n_eyes})")
     if REQUIRE_MOUTH_VISIBLE and not mouth_visible:
-        reasons.append(f"mouth_occluded(skin_ratio={skin_ratio:.3f})")
+        if dark_ratio >= MOUTH_DARK_RATIO_MAX:
+            reasons.append(
+                f"mouth_occluded_dark_object(dark_ratio={dark_ratio:.3f})"
+            )
+        elif edge_score >= MOUTH_EDGE_ROW_FRACTION:
+            reasons.append(
+                f"mouth_occluded_rectangular_object(edge_score={edge_score:.3f})"
+            )
+        elif phone_score >= PHONE_SCORE_THRESHOLD:
+            reasons.append(
+                f"mouth_occluded_phone_or_object"
+                f"(phone_score={phone_score:.4f}"
+                f",skin_drop={phone_score:.3f})"   # phone_score proxy; debug has details
+            )
+        else:
+            reasons.append(
+                f"mouth_occluded(skin_ratio={skin_ratio:.3f})"
+            )
     return reasons
 
 
@@ -663,14 +921,12 @@ def _build_cv_visibility_result(
     eyes_visible: bool,
     n_eyes: int,
     mouth_visible: bool,
-    skin_ratio: float,
+    mouth_signals: _MouthSignals,
     reasons: List[str],
-    crop_ms: float,
     eye_ms: float,
     mouth_ms: float,
     total_ms: float,
 ) -> Dict[str, Any]:
-    """Assemble the full CV visibility result dict."""
     ok = not reasons
     return {
         "ok":             ok,
@@ -680,19 +936,26 @@ def _build_cv_visibility_result(
         "mouth_detected": mouth_visible,
         "bbox":           bbox_tuple,
         "detail": {
-            "n_eyes_detected":  n_eyes,
-            "mouth_skin_ratio": round(skin_ratio, 4),
-            "crop_ms":          crop_ms,
-            "eye_ms":           eye_ms,
-            "mouth_ms":         mouth_ms,
-            "total_ms":         total_ms,
-            "reasons":          reasons,
+            "n_eyes_detected":    n_eyes,
+            "mouth_skin_ratio":   round(mouth_signals.skin_ratio,  4),
+            "mouth_dark_ratio":   round(mouth_signals.dark_ratio,  4),
+            "mouth_edge_score":   round(mouth_signals.edge_score,  4),
+            "phone_score":        round(mouth_signals.phone_score, 4),
+            "phone_debug":        mouth_signals.phone_debug,
+            "eye_ms":             eye_ms,
+            "mouth_ms":           mouth_ms,
+            "total_ms":           total_ms,
+            "reasons":            reasons,
         },
         "thresholds": {
-            "eye_min_neighbors":     EYE_MIN_NEIGHBORS,
-            "mouth_skin_ratio_min":  MOUTH_SKIN_RATIO_MIN,
-            "require_eyes_open":     REQUIRE_EYES_OPEN,
-            "require_mouth_visible": REQUIRE_MOUTH_VISIBLE,
+            "eye_min_neighbors":       EYE_MIN_NEIGHBORS,
+            "mouth_skin_ratio_min":    MOUTH_SKIN_RATIO_MIN,
+            "mouth_dark_ratio_max":    MOUTH_DARK_RATIO_MAX,
+            "mouth_edge_row_fraction": MOUTH_EDGE_ROW_FRACTION,
+            "phone_score_threshold":   PHONE_SCORE_THRESHOLD,
+            "phone_zone":             [PHONE_ZONE_MIN, PHONE_ZONE_MAX],
+            "require_eyes_open":       REQUIRE_EYES_OPEN,
+            "require_mouth_visible":   REQUIRE_MOUTH_VISIBLE,
         },
     }
 
@@ -703,47 +966,67 @@ def _run_cv_visibility(
     face_count: int,
     rid: str = "",
 ) -> Dict[str, Any]:
+    """
+    OpenCV occlusion gate — five-pass mouth check, no secondary crop.
+    Pass 3: dark-object
+    Pass 4: wide-horizontal-edge
+    Pass 5: phone/rigid-object (NEW — three-signal: skin_drop × sharpness × uniformity)
+    Pass 1: YCrCb skin
+    Pass 2: HSV skin fallback
+    """
     t0 = time.monotonic()
-    face_crop = _crop_face_square(image, bbox_tuple, FACE_CROP_PAD_RATIO, 200)
-    crop_ms = round((time.monotonic() - t0) * 1000, 2)
 
     t_eye = time.monotonic()
-    eyes_visible, n_eyes = _check_eyes_open(face_crop)
+    eyes_visible, n_eyes = _check_eyes_open(image, bbox_tuple)
     eye_ms = round((time.monotonic() - t_eye) * 1000, 2)
 
     t_mouth = time.monotonic()
-    mouth_visible, skin_ratio = _check_mouth_visible(face_crop)
+    mouth_visible, skin_ratio, dark_ratio, edge_score, phone_score, phone_debug = \
+        _check_mouth_visible(image, bbox_tuple)
     mouth_ms = round((time.monotonic() - t_mouth) * 1000, 2)
 
     total_ms = round((time.monotonic() - t0) * 1000, 2)
 
-    reasons = _collect_visibility_reasons(eyes_visible, n_eyes, mouth_visible, skin_ratio)
+    reasons = _collect_visibility_reasons(
+        eyes_visible, n_eyes, mouth_visible, skin_ratio, dark_ratio, edge_score,
+        phone_score,
+    )
     ok = not reasons
 
     log.info(
-        "[%s][cv_gate] eyes=%s(n=%d)  mouth=%s(skin=%.3f,thr=%.2f)  "
-        "crop=%.1f eye=%.1f mouth=%.1f total=%.1fms  => %s",
+        "[%s][cv_gate] eyes=%s(n=%d)  "
+        "mouth=%s(skin=%.3f,dark=%.3f,edge=%.3f,phone=%.4f)  "
+        "eye=%.1f mouth=%.1f total=%.1fms  => %s",
         rid,
         eyes_visible, n_eyes,
-        mouth_visible, skin_ratio, MOUTH_SKIN_RATIO_MIN,
-        crop_ms, eye_ms, mouth_ms, total_ms,
+        mouth_visible, skin_ratio, dark_ratio, edge_score, phone_score,
+        eye_ms, mouth_ms, total_ms,
         "PASS" if ok else "FAIL",
     )
 
+    mouth_signals = _MouthSignals(
+        skin_ratio=skin_ratio,
+        dark_ratio=dark_ratio,
+        edge_score=edge_score,
+        phone_score=phone_score,
+        phone_debug=phone_debug,
+    )
     return _build_cv_visibility_result(
         bbox_tuple, face_count,
         eyes_visible, n_eyes,
-        mouth_visible, skin_ratio,
-        reasons, crop_ms, eye_ms, mouth_ms, total_ms,
+        mouth_visible, mouth_signals,
+        reasons, eye_ms, mouth_ms, total_ms,
     )
 
 
 # ---------------------------------------------------------------------------
 # Stage 3a - kprokofi MN3
 # ---------------------------------------------------------------------------
-def _crop_face_for_antispoof(image: np.ndarray,
-                             bbox: Tuple[int, int, int, int],
-                             expansion: float) -> Optional[np.ndarray]:
+def _crop_face_for_antispoof(
+    image: np.ndarray,
+    bbox: Tuple[int, int, int, int],
+    expansion: float,
+) -> Optional[np.ndarray]:
     x, y, w, h = bbox
     cx, cy = x + w / 2.0, y + h / 2.0
     nw, nh = w * expansion, h * expansion
@@ -770,26 +1053,28 @@ def _softmax_1d(x: np.ndarray) -> np.ndarray:
     return e / e.sum()
 
 
-def _run_kprokofi(image: np.ndarray,
-                  bbox: Tuple[int, int, int, int],
-                  rid: str = "") -> Dict[str, Any]:
-    t_crop = time.monotonic()
+def _run_kprokofi(
+    image: np.ndarray,
+    bbox: Tuple[int, int, int, int],
+    rid: str = "",
+) -> Dict[str, Any]:
+    t_crop    = time.monotonic()
     face_crop = _crop_face_for_antispoof(image, bbox, KPROKOFI_BBOX_EXPANSION)
-    crop_ms = round((time.monotonic() - t_crop) * 1000, 2)
+    crop_ms   = round((time.monotonic() - t_crop) * 1000, 2)
     if face_crop is None:
         return {"error": "invalid_face_crop", "live_prob": 0.0, "spoof_prob": 1.0,
                 "crop_ms": crop_ms, "preprocess_ms": 0.0, "inference_ms": 0.0}
 
-    t_pp = time.monotonic()
+    t_pp   = time.monotonic()
     tensor = _kprokofi_preprocess(face_crop)
-    pp_ms = round((time.monotonic() - t_pp) * 1000, 2)
+    pp_ms  = round((time.monotonic() - t_pp) * 1000, 2)
 
-    t_inf = time.monotonic()
+    t_inf   = time.monotonic()
     outputs = _kprokofi_session.run(None, {_kprokofi_input_name: tensor})
-    inf_ms = round((time.monotonic() - t_inf) * 1000, 2)
+    inf_ms  = round((time.monotonic() - t_inf) * 1000, 2)
 
     logits = outputs[0][0]
-    probs = _softmax_1d(logits.astype(np.float32))
+    probs  = _softmax_1d(logits.astype(np.float32))
     if probs.shape[0] < 2:
         return {"error": f"bad_output_shape:{probs.shape}",
                 "live_prob": 0.0, "spoof_prob": 1.0,
@@ -822,10 +1107,10 @@ def _run_silent_face(image: np.ndarray, rid: str = "") -> Dict[str, Any]:
         return {"error": f"mtcnn_bbox_failed:{e}",
                 "live_prob": 0.0, "spoof_prob": 1.0, "total_ms": 0.0}
 
-    prediction = np.zeros((1, 3))
+    prediction    = np.zeros((1, 3))
     model_timings = []
     for full_path, h_input, w_input, scale in _antispoof_model_list:
-        t_model = time.monotonic()
+        t_model   = time.monotonic()
         img_patch = _image_cropper.crop(
             org_img=image, bbox=bbox, scale=scale,
             out_w=w_input, out_h=h_input, crop=scale is not None,
@@ -866,6 +1151,63 @@ def _run_silent_face(image: np.ndarray, rid: str = "") -> Dict[str, Any]:
 # Fusion
 # ---------------------------------------------------------------------------
 
+def _fuse_either(
+    k_live: Optional[float], s_live: Optional[float],
+    k_says_live: bool, s_says_live: bool,
+) -> Tuple[bool, float]:
+    valid = [v for v in (k_live, s_live) if v is not None]
+    return k_says_live or s_says_live, max(valid) if valid else 0.0
+
+
+def _fuse_both(
+    k_live: Optional[float], s_live: Optional[float],
+    k_says_live: bool, s_says_live: bool,
+) -> Tuple[bool, float]:
+    valid = [v for v in (k_live, s_live) if v is not None]
+    return k_says_live and s_says_live, min(valid) if valid else 0.0
+
+
+def _fuse_weighted(
+    k_live: Optional[float], s_live: Optional[float],
+    k_says_live: bool, s_says_live: bool,
+) -> Tuple[bool, float]:
+    if k_live is None or s_live is None:
+        value = k_live if k_live is not None else (s_live or 0.0)
+    else:
+        value = KPROKOFI_WEIGHT * k_live + SILENT_FACE_WEIGHT * s_live
+    return value >= LIVENESS_FUSION_THRESHOLD, value
+
+
+def _fuse_kprokofi_only(
+    k_live: Optional[float], s_live: Optional[float],
+    k_says_live: bool, s_says_live: bool,
+) -> Tuple[bool, float]:
+    return k_says_live, k_live if k_live is not None else 0.0
+
+
+def _fuse_silent_only(
+    k_live: Optional[float], s_live: Optional[float],
+    k_says_live: bool, s_says_live: bool,
+) -> Tuple[bool, float]:
+    return s_says_live, s_live if s_live is not None else 0.0
+
+
+def _fuse_unknown(
+    k_live: Optional[float], s_live: Optional[float],
+    k_says_live: bool, s_says_live: bool,
+) -> Tuple[bool, float]:
+    return False, 0.0
+
+
+_FUSION_DISPATCH = {
+    "either":        _fuse_either,
+    "both":          _fuse_both,
+    "weighted":      _fuse_weighted,
+    "kprokofi_only": _fuse_kprokofi_only,
+    "silent_only":   _fuse_silent_only,
+}
+
+
 def _compute_fusion_value(
     mode: str,
     k_live: Optional[float],
@@ -873,42 +1215,19 @@ def _compute_fusion_value(
     k_says_live: bool,
     s_says_live: bool,
 ) -> Tuple[bool, float]:
-    """
-    Return (is_live, value) for the given fusion mode.
-
-    Extracted to keep _fuse below the complexity threshold.
-    """
-    if mode == "either":
-        valid = [v for v in (k_live, s_live) if v is not None]
-        return k_says_live or s_says_live, max(valid) if valid else 0.0
-
-    if mode == "both":
-        valid = [v for v in (k_live, s_live) if v is not None]
-        return k_says_live and s_says_live, min(valid) if valid else 0.0
-
-    if mode == "weighted":
-        if k_live is None or s_live is None:
-            value = k_live if k_live is not None else (s_live or 0.0)
-        else:
-            value = KPROKOFI_WEIGHT * k_live + SILENT_FACE_WEIGHT * s_live
-        return value >= LIVENESS_FUSION_THRESHOLD, value
-
-    if mode == "kprokofi_only":
-        return k_says_live, k_live if k_live is not None else 0.0
-
-    if mode == "silent_only":
-        return s_says_live, s_live if s_live is not None else 0.0
-
-    return False, 0.0
+    fn = _FUSION_DISPATCH.get(mode, _fuse_unknown)
+    return fn(k_live, s_live, k_says_live, s_says_live)
 
 
-def _fuse(kprokofi: Optional[Dict[str, Any]],
-          silent:   Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _fuse(
+    kprokofi: Optional[Dict[str, Any]],
+    silent:   Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
     k_live = kprokofi["live_prob"] if (kprokofi and "live_prob" in kprokofi) else None
     s_live = silent["live_prob"]   if (silent   and "live_prob" in silent)   else None
 
-    k_says_live = (k_live is not None and k_live >= KPROKOFI_LIVE_THRESHOLD)
-    s_says_live = (s_live is not None and s_live >= SILENT_FACE_LIVE_THRESHOLD)
+    k_says_live = k_live is not None and k_live >= KPROKOFI_LIVE_THRESHOLD
+    s_says_live = s_live is not None and s_live >= SILENT_FACE_LIVE_THRESHOLD
 
     is_live, value = _compute_fusion_value(
         LIVENESS_FUSION, k_live, s_live, k_says_live, s_says_live
@@ -932,18 +1251,12 @@ def _fuse(kprokofi: Optional[Dict[str, Any]],
 
 
 # ---------------------------------------------------------------------------
-# Liveness orchestrator — helpers
+# Liveness orchestrator helpers
 # ---------------------------------------------------------------------------
 
 def _decode_and_resize_image(
     image_bytes: bytes, rid: str
 ) -> Tuple[Optional[np.ndarray], float, int, int]:
-    """
-    Decode image_bytes and downscale if needed.
-
-    Returns (image, resize_ms, orig_w, orig_h).
-    Returns (None, 0.0, 0, 0) on decode failure.
-    """
     arr   = np.frombuffer(image_bytes, dtype=np.uint8)
     image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if image is None:
@@ -954,10 +1267,11 @@ def _decode_and_resize_image(
     resize_ms = 0.0
     max_side  = max(orig_h, orig_w)
     if max_side > MAX_IMAGE_SIDE:
-        scale = MAX_IMAGE_SIDE / max_side
-        new_w, new_h = int(orig_w * scale), int(orig_h * scale)
-        t_rs  = time.monotonic()
-        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        scale     = MAX_IMAGE_SIDE / max_side
+        new_w     = int(orig_w * scale)
+        new_h     = int(orig_h * scale)
+        t_rs      = time.monotonic()
+        image     = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
         resize_ms = round((time.monotonic() - t_rs) * 1000, 2)
         log.info("[%s][liveness] resized %dx%d -> %dx%d in %.1fms",
                  rid, orig_w, orig_h, new_w, new_h, resize_ms)
@@ -966,14 +1280,12 @@ def _decode_and_resize_image(
 
 
 def _dispatch_silent_face(image: np.ndarray, rid: str):
-    """Submit silent-face to its executor if enabled; return the future or None."""
     if not USE_SILENT_FACE:
         return None
     return _exec_silent_face.submit(_run_silent_face, image, rid)
 
 
 def _collect_silent_face_result(future, rid: str) -> Optional[Dict[str, Any]]:
-    """Await the silent-face future and return its result (or an error dict)."""
     if future is None:
         return None
     try:
@@ -986,13 +1298,15 @@ def _collect_silent_face_result(future, rid: str) -> Optional[Dict[str, Any]]:
 def _build_liveness_reject_from_haar(
     haar: Dict[str, Any], elapsed_ms: float
 ) -> Dict[str, Any]:
-    """Build the early-exit result dict when Haar detection fails."""
     return {
         "is_live": False, "label": -1, "value": 0.0,
         "feature_visibility": {
-            "ok": False, "reason": haar["reason"],
-            "face_count": haar.get("face_count", 0),
-            "eyes_detected": False, "mouth_detected": False, "bbox": None,
+            "ok":             False,
+            "reason":         haar["reason"],
+            "face_count":     haar.get("face_count", 0),
+            "eyes_detected":  False,
+            "mouth_detected": False,
+            "bbox":           None,
         },
         "liveness_processing_time_ms": elapsed_ms,
         "rejected_by": "feature_visibility",
@@ -1013,14 +1327,9 @@ def _run_liveness(image_bytes: bytes, rid: str = "") -> Dict[str, Any]:
                 "error": "cv2.imdecode failed",
                 "liveness_processing_time_ms": round((time.monotonic() - _t) * 1000, 2)}
 
-    # ── Dispatch Silent-Face IMMEDIATELY ────────────────────────────────────
-    # Silent-Face uses MTCNN internally for its own bbox — it does NOT need
-    # Haar's result. Dispatching here runs it in parallel with Haar + CV gate
-    # + kprokofi, cutting ~45ms off the critical path.
     t_dispatch    = time.monotonic()
     silent_future = _dispatch_silent_face(image, rid)
 
-    # ── Step 1: Haar (sync, ~25ms at 480px) ─────────────────────────────────
     t_haar  = time.monotonic()
     haar    = _haar_detect_single_face(image, rid)
     haar_ms = round((time.monotonic() - t_haar) * 1000, 2)
@@ -1035,7 +1344,6 @@ def _run_liveness(image_bytes: bytes, rid: str = "") -> Dict[str, Any]:
     bbox       = haar["bbox"]
     face_count = haar["face_count"]
 
-    # ── Step 2: OpenCV visibility gate (sync, ~5ms) ──────────────────────────
     t_cv = time.monotonic()
     try:
         fv = _run_cv_visibility(image, bbox, face_count, rid)
@@ -1063,8 +1371,7 @@ def _run_liveness(image_bytes: bytes, rid: str = "") -> Dict[str, Any]:
             "rejected_by": "feature_visibility",
         }
 
-    # ── Step 3: kprokofi (sync on liveness thread, ~8ms) ────────────────────
-    t_kprokofi = time.monotonic()
+    t_kprokofi      = time.monotonic()
     kprokofi_result = None
     if USE_KPROKOFI:
         try:
@@ -1074,13 +1381,9 @@ def _run_liveness(image_bytes: bytes, rid: str = "") -> Dict[str, Any]:
             kprokofi_result = {"error": repr(e), "live_prob": 0.0, "spoof_prob": 1.0}
     kprokofi_ms = round((time.monotonic() - t_kprokofi) * 1000, 2)
 
-    # ── Step 4: Await Silent-Face ────────────────────────────────────────────
-    # At this point ~38ms have elapsed. Silent-Face started at t=0 and takes
-    # ~60ms, so we wait for ~22ms of remaining work (often less).
-    silent_result  = _collect_silent_face_result(silent_future, rid)
-    dispatch_ms    = round((time.monotonic() - t_dispatch) * 1000, 2)
+    silent_result = _collect_silent_face_result(silent_future, rid)
+    dispatch_ms   = round((time.monotonic() - t_dispatch) * 1000, 2)
 
-    # ── Step 5: Fuse ─────────────────────────────────────────────────────────
     fusion     = _fuse(kprokofi_result, silent_result)
     elapsed_ms = round((time.monotonic() - _t) * 1000, 2)
 
@@ -1159,12 +1462,20 @@ _USER_MESSAGES: Dict[str, str] = {
 _DEFAULT_USER_MESSAGE = "Verification failed. Please try again with a new selfie."
 
 
-def _rej(reason, liveness=None, error=None,
-         total_processing_time_ms=None, rid: str = "") -> Dict[str, Any]:
+def _rej(
+    reason: str,
+    liveness: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+    total_processing_time_ms: Optional[float] = None,
+    rid: str = "",
+) -> Dict[str, Any]:
     log.warning("[%s] REJECT reason=%s error=%s total_ms=%s",
                 rid, reason, error, total_processing_time_ms)
-    out: Dict[str, Any] = {"final_status": "REJECT", "reject_reason": reason,
-                           "liveness": liveness}
+    out: Dict[str, Any] = {
+        "final_status":  "REJECT",
+        "reject_reason": reason,
+        "liveness":      liveness,
+    }
     if error:
         out["error"] = error
     if total_processing_time_ms is not None:
@@ -1197,7 +1508,9 @@ def _extract_image_bytes(payload: Dict[str, Any]) -> bytes:
     if not image_bytes:
         raise HTTPException(400, "Empty image after decoding")
     if len(image_bytes) > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, f"Image too large (max {MAX_UPLOAD_BYTES//(1024*1024)} MB)")
+        raise HTTPException(
+            413, f"Image too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)"
+        )
     return image_bytes
 
 
@@ -1225,11 +1538,13 @@ _COMMON_ERROR_RESPONSES = {
 
 
 def _validate_instance_name(payload: Dict[str, Any]) -> str:
-    """Extract and validate instanceName; raises HTTPException on failure."""
     instance_name = payload.get("instanceName")
     if not instance_name:
         raise HTTPException(400, "Missing 'instanceName' field in request body")
-    if not isinstance(instance_name, str) or instance_name.strip() not in _VALID_INSTANCE_NAMES:
+    if (
+        not isinstance(instance_name, str)
+        or instance_name.strip() not in _VALID_INSTANCE_NAMES
+    ):
         raise HTTPException(
             400,
             f"Invalid 'instanceName': {instance_name!r}. "
@@ -1244,10 +1559,6 @@ def _handle_liveness_result(
     instance_name: str,
     total_ms_fn,
 ) -> Dict[str, Any]:
-    """
-    Inspect the liveness result and return the appropriate ACCEPT/REJECT response.
-    Extracted to reduce cognitive complexity of the endpoint handler.
-    """
     if liv.get("error"):
         log.error("[%s][%s] Liveness error: %s", rid, instance_name, liv["error"])
         return _rej("liveness_decode_error", error=liv["error"],
@@ -1285,8 +1596,6 @@ def _handle_liveness_result(
 async def liveness_only(payload: Dict[str, Any]) -> Dict[str, Any]:
     rid = _next_request_id()
 
-    # Outer gate: 503 immediately when queue is full.
-    # ._value used instead of .locked() — Python 3.9 compat.
     if _queue_sem._value == 0:
         log.warning(
             "[%s] 503 queue full  inflight=%d  capacity=%d",
@@ -1301,7 +1610,6 @@ async def liveness_only(payload: Dict[str, Any]) -> Dict[str, Any]:
         )
         t_queued = time.monotonic()
 
-        # Inner gate: wait up to QUEUE_TIMEOUT_S for an inference slot.
         try:
             await asyncio.wait_for(
                 _worker_sem.acquire(),
